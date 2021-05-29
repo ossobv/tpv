@@ -5,6 +5,10 @@
 #include <string.h>
 #include <unistd.h>
 
+#ifdef USE_RUSAGE
+# include <sys/resource.h>
+#endif
+
 #define BUFFER_SIZE (128L * 1024L)
 
 #define likely(x)   __builtin_expect((x), 1)
@@ -114,7 +118,21 @@ static void finish() {
 }
 
 static void show_summary() {
+#ifdef USE_RUSAGE
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) == 0) {
+        fprintf(stderr,
+                "textpv: %zu bytes, %zu.%03zu utime, %zu.%03zu stime\n",
+                state.bytes,
+                ru.ru_utime.tv_sec, ru.ru_utime.tv_usec / 1000,
+                ru.ru_stime.tv_sec, ru.ru_stime.tv_usec / 1000);
+    } else {
+        perror("getrusage");
+        fprintf(stderr, "textpv: %zu bytes\n", state.bytes);
+    }
+#else
     fprintf(stderr, "textpv: %zu bytes\n", state.bytes);
+#endif
 }
 
 
