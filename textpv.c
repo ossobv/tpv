@@ -5,7 +5,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#define BUFFER_SIZE (32L * 1024L)
+#define BUFFER_SIZE (128L * 1024L)
 
 #define likely(x)   __builtin_expect((x), 1)
 #define unlikely(x) __builtin_expect((x), 0)
@@ -17,6 +17,9 @@ struct buffer_t {
 
 struct state_t {
     struct buffer_t buffers[2];
+    off_t bytes;
+    unsigned read_buffer;
+    unsigned write_buffer;
 };
 
 struct state_t state;
@@ -27,32 +30,32 @@ static void setup_signals() {
 }
 
 static void setup_state() {
-    state.buffers[0].size = BUFFER_SIZE;
-    state.buffers[1].size = BUFFER_SIZE;
+    for (unsigned buf_idx = 0; buf_idx < 2; ++buf_idx) {
+        state.buffers[buf_idx].size = BUFFER_SIZE;
+    }
 }
 
 static void read_abort() {
-    fprintf(stderr, "read error\n");
+    perror("read?");
     exit(4);
 }
 
 static void write_abort() {
-    fprintf(stderr, "write error\n");
+    perror("write?");
     exit(2);
 }
 
-static int fill_one_buffer(unsigned buf_idx) {
+static int fill_one_buffer(struct buffer_t *buf) {
     unsigned off = 0;
     do {
         ssize_t size = read(
-            STDIN_FILENO, state.buffers[buf_idx].data + off,
-            BUFFER_SIZE - off);
+            STDIN_FILENO, buf->data + off, BUFFER_SIZE - off);
         if (unlikely(size < 0)) {
             read_abort();
             return 0;
         }
         if (unlikely(size == 0)) {
-            state.buffers[buf_idx].size = off;
+            buf->size = off;
             return 0;
         }
         off += size;
@@ -62,47 +65,67 @@ static int fill_one_buffer(unsigned buf_idx) {
     } while (1);
 }
 
-static void empty_one_buffer(unsigned buf_idx) {
+static void empty_one_buffer(struct buffer_t *buf, off_t *bytes) {
     unsigned off = 0;
-    unsigned to_write = state.buffers[buf_idx].size;
+    unsigned to_write = buf->size;
     assert(to_write != 0);
     do {
         ssize_t size = write(
-            STDOUT_FILENO, state.buffers[buf_idx].data + off,
-            to_write - off);
+            STDOUT_FILENO, buf->data + off, to_write - off);
         if (unlikely(size <= 0)) {
             write_abort();
             return;
         }
         off += size;
         if (likely(off == to_write)) {
+            *bytes += to_write;
             return;
         }
     } while (1);
 }
 
-static void feed() {
-    unsigned write_buffer = 0;
-    if (likely(fill_one_buffer(0))) {
-        unsigned read_buffer = 1;
-        while (likely(fill_one_buffer(read_buffer))) {
-            empty_one_buffer(write_buffer);
-            read_buffer = !read_buffer;
-            write_buffer = !write_buffer;
+static void passthrough() {
+    state.write_buffer = 0;
+    state.read_buffer = 0;
+    if (likely(fill_one_buffer(&state.buffers[state.read_buffer]))) {
+        state.read_buffer = 1;
+        while (likely(fill_one_buffer(&state.buffers[state.read_buffer]))) {
+            empty_one_buffer(&state.buffers[state.write_buffer], &state.bytes);
+            state.read_buffer = !state.read_buffer;
+            state.write_buffer = !state.write_buffer;
         }
-        empty_one_buffer(write_buffer);
-        write_buffer = !write_buffer;
+        empty_one_buffer(&state.buffers[state.write_buffer], &state.bytes);
+        state.write_buffer = !state.write_buffer;
     }
-    if (state.buffers[write_buffer].size != 0) {
-        empty_one_buffer(write_buffer);
+    if (state.buffers[state.write_buffer].size != 0) {
+        empty_one_buffer(&state.buffers[state.write_buffer], &state.bytes);
     }
 }
+
+static void finish() {
+    /* Close STDIN/STDOUT so we don't fail just because we're doing
+     * stuff at summary time. */
+    if (close(STDOUT_FILENO) != 0) {
+        perror("close(STDOUT_FILENO)");
+    }
+    if (close(STDIN_FILENO) != 0) {
+        perror("close(STDIN_FILENO)");
+    }
+}
+
+static void show_summary() {
+    fprintf(stderr, "textpv: %zu bytes\n", state.bytes);
+}
+
 
 int main() {
     setup_signals();
     setup_state();
-    feed();
-    // write_last_bytes/buffers to some tempfile..
-    // write rusage
+
+    passthrough();
+    finish();
+
+    // TODO: write_last_bytes/buffers to some tempfile..
+    show_summary();
     return 0;
 }
