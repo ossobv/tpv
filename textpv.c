@@ -1,4 +1,8 @@
 /* vim: set ts=8 sw=4 sts=4 et ai: */
+#if defined(USE_SPLICE)
+# define _GNU_SOURCE /* splice() and F_SETPIPE_SZ */
+#endif
+
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,13 +13,23 @@
 # include <sys/resource.h>
 #endif
 
+#ifdef USE_SPLICE
+/* sendfile() does not work on stdin/stdout, splice() does. */
+# include <fcntl.h>
+#endif
+
 #define BUFFER_SIZE (128L * 1024L)
 
 #define likely(x)   __builtin_expect((x), 1)
 #define unlikely(x) __builtin_expect((x), 0)
 
 struct buffer_t {
+#ifdef USE_SPLICE
+    int pipe_w;
+    int pipe_r;
+#else
     char data[BUFFER_SIZE];
+#endif
     unsigned size;
 };
 
@@ -35,6 +49,26 @@ static void setup_signals() {
 
 static void setup_state() {
     for (unsigned buf_idx = 0; buf_idx < 2; ++buf_idx) {
+#ifdef USE_SPLICE
+        int pipes[2];
+        if (pipe(pipes) != 0) {
+            perror("pipe");
+            exit(1);
+        }
+        state.buffers[buf_idx].pipe_r = pipes[0];
+        state.buffers[buf_idx].pipe_w = pipes[1];
+        /* Note that because of the way the pages of the pipe buffer
+         * are employed when data is written to the pipe, the number
+         * of bytes that can be written may be less than the nominal
+         * size, depending on the size of the writes. */
+        /* XXX: do we need more bytes because of that? */
+        if (fcntl(
+                state.buffers[buf_idx].pipe_w, F_SETPIPE_SZ,
+                BUFFER_SIZE) != BUFFER_SIZE) {
+            perror("fcntl");
+            exit(1);
+        }
+#endif
         state.buffers[buf_idx].size = BUFFER_SIZE;
     }
 }
@@ -52,8 +86,13 @@ static void write_abort() {
 static int fill_one_buffer(struct buffer_t *buf) {
     unsigned off = 0;
     do {
+#ifdef USE_SPLICE
+        ssize_t size = splice(STDIN_FILENO, NULL, buf->pipe_w, NULL,
+            BUFFER_SIZE - off, SPLICE_F_MORE | SPLICE_F_MOVE);
+#else
         ssize_t size = read(
             STDIN_FILENO, buf->data + off, BUFFER_SIZE - off);
+#endif
         if (unlikely(size < 0)) {
             read_abort();
             return 0;
@@ -74,8 +113,13 @@ static void empty_one_buffer(struct buffer_t *buf, off_t *bytes) {
     unsigned to_write = buf->size;
     assert(to_write != 0);
     do {
+#ifdef USE_SPLICE
+        ssize_t size = splice(buf->pipe_r, NULL, STDOUT_FILENO, NULL,
+            BUFFER_SIZE - off, SPLICE_F_MORE | SPLICE_F_MOVE);
+#else
         ssize_t size = write(
             STDOUT_FILENO, buf->data + off, to_write - off);
+#endif
         if (unlikely(size <= 0)) {
             write_abort();
             return;
