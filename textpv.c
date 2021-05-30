@@ -5,6 +5,7 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -106,11 +107,117 @@ static void setup_state() {
     state.write_idx = 0;
 }
 
+#ifdef USE_SPLICE
+static unsigned safe_read(int fd, char *dest, ssize_t size) {
+    struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+    unsigned off = 0;
+    while (size) {
+        ssize_t ret;
+        int pollret;
+
+        /* This MUST succeed if there is data in the pipe. If we're only
+         * reading a partial pipe, then we would be reordering data. And
+         * that would be bad. */
+        do {
+            pollret = poll(&pfd, 1, 0);
+            if (unlikely(pollret < 0) && errno != EINTR) {
+                perror("textpv: poll");
+                exit(1);
+            }
+        } while (pollret < 0);
+        if (pollret == 0) {
+            /* Aborting sooner than expected. Maybe someone has read the
+             * pipe already. The worst thing we can do is block at this
+             * point. Return now. */
+            return off;
+        }
+
+        ret = read(fd, dest, size);
+        if (likely(size == ret)) {
+            off += (unsigned)ret;
+            return off;
+        }
+        if (unlikely(ret <= 0)) {
+            perror("textpv: safe_read");
+            exit(1);
+        }
+        size -= ret;
+        off += (unsigned)ret;
+    }
+    return off;
+}
+
+static void safe_write(int fd, const char *source, ssize_t size) {
+    while (size) {
+        ssize_t ret = write(fd, source, size);
+        if (likely(size == ret)) {
+            return;
+        }
+        if (unlikely(ret <= 0)) {
+            perror("textpv: safe_write");
+            exit(1);
+        }
+        size -= ret;
+    }
+}
+
+/**
+ * pipe_peek copies the data into a buffer and feeds it back into the
+ * pipe, making it a convoluted "peek" operation.
+ *
+ * This only works if 'size' is equal to the entire buffer in the size.
+ * If there was more data in the pipe, we would now have reordered it.
+ */
+static unsigned pipe_peek(int pipe_r, int pipe_w, char *buf, unsigned size) {
+    unsigned read = safe_read(pipe_r, buf, size);
+    if (read) {
+        safe_write(pipe_w, buf, read);
+    }
+    return read;
+}
+#endif
+
+static void print_read_write_state() {
+    const struct buffer_t *buf0, *buf1; /* but the FDs are mutable */
+    char data[BUFFER_SIZE * 2];
+    unsigned size;
+    if (unlikely(state.buffers[0].bytes_read == state.buffers[1].bytes_read)) {
+        fprintf(stderr, "textpv: nothing written yet\n");
+        return;
+    }
+    if (state.buffers[0].bytes_read > state.buffers[1].bytes_read) {
+        buf0 = &state.buffers[1];
+        buf1 = &state.buffers[0];
+    } else {
+        buf0 = &state.buffers[0];
+        buf1 = &state.buffers[1];
+    }
+#ifdef USE_SPLICE
+    size = pipe_peek(buf0->pipe_r, buf0->pipe_w, data, buf0->size);
+    size += pipe_peek(buf1->pipe_r, buf1->pipe_w, data + size, buf1->size);
+#else
+    memcpy(data, buf0->data, buf0->size);
+    memcpy(data + buf0->size, buf1->data, buf1->size);
+    size = buf0->size + buf1->size;
+#endif
+    // fprintf(stderr, "[[[ %.*s ]]]\n", size, data);
+    // lfs = count_lfs(buf1)
+    // fprintf(
+    //     stderr, "we have buf0 %zu size %u and buf1 %zu size %u\n",
+    //     buf0->bytes_read, buf0->size, buf1->bytes_read, buf1->size);
+    fprintf(
+        stderr,
+        "textpv: at least %zu (0x%zx) bytes written, curbuf %u\n",
+        state.bytes_written, state.bytes_written, size);
+}
+
 static void read_abort() {
     int error = errno;
     if (close(STDOUT_FILENO) != 0) {
         perror("textpv: close(STDOUT_FILENO)");
     }
+
+    print_read_write_state();
 
     errno = error;
     perror("textpv: read error");
@@ -122,6 +229,8 @@ static void write_abort() {
     if (close(STDIN_FILENO) != 0) {
         perror("textpv: close(STDIN_FILENO)");
     }
+
+    print_read_write_state();
 
     errno = error;
     perror("textpv: write error");
@@ -249,7 +358,7 @@ static void show_summary() {
 }
 
 static void on_alarm(int signum) {
-    fprintf(stderr, "textpv: %zu bytes\n", state.bytes_written);
+    print_read_write_state();
 }
 
 static void on_pipe(int signum) {
