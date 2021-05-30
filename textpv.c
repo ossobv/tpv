@@ -25,27 +25,27 @@
 #define CSI_EL "\x1b[K" /* erase from cursor to end of line */
 
 #define BUFFER_SIZE (128L * 1024L)
+#define BUFFERS 16 /* 16 * 128K == 2M */
 
 #define likely(x)   __builtin_expect((x), 1)
 #define unlikely(x) __builtin_expect((x), 0)
 
 struct buffer_t {
-    off_t bytes_read;
     unsigned size;
 #ifdef USE_SPLICE
     int pipe_r;
     int pipe_w;
 #else
+    unsigned oldsize;
     char data[BUFFER_SIZE];
 #endif
 };
 
 struct state_t {
-    struct buffer_t buffers[2];
+    struct buffer_t buffers[BUFFERS];
     off_t bytes_read;
     off_t bytes_written;
-    unsigned read_idx;
-    unsigned write_idx;
+    unsigned rdwr_idx;
 };
 
 struct state_t state;
@@ -79,7 +79,7 @@ static void setup_signals() {
 }
 
 static void setup_state() {
-    for (unsigned buf_idx = 0; buf_idx < 2; ++buf_idx) {
+    for (unsigned rdwr_idx = 0; rdwr_idx < BUFFERS; ++rdwr_idx) {
 #ifdef USE_SPLICE
         int pipes[2];
         if (isatty(STDOUT_FILENO)) {
@@ -92,8 +92,8 @@ static void setup_state() {
             perror(CSI_EL "textpv: pipe");
             exit(1);
         }
-        state.buffers[buf_idx].pipe_r = pipes[0];
-        state.buffers[buf_idx].pipe_w = pipes[1];
+        state.buffers[rdwr_idx].pipe_r = pipes[0];
+        state.buffers[rdwr_idx].pipe_w = pipes[1];
 
         /* Note that because of the way the pages of the pipe buffer
          * are employed when data is written to the pipe, the number
@@ -101,17 +101,18 @@ static void setup_state() {
          * size, depending on the size of the writes. */
         /* XXX: do we need more bytes because of that? */
         if (fcntl(
-                state.buffers[buf_idx].pipe_w, F_SETPIPE_SZ,
+                state.buffers[rdwr_idx].pipe_w, F_SETPIPE_SZ,
                 BUFFER_SIZE) < BUFFER_SIZE) {
             perror(CSI_EL "textpv: fcntl(F_SETPIPE_SZ)");
             exit(1);
         }
+#else
+        state.buffers[rdwr_idx].oldsize = 0;
 #endif
-        state.buffers[buf_idx].size = BUFFER_SIZE;
+        state.buffers[rdwr_idx].size = 0;
     }
     state.bytes_written = 0;
-    state.read_idx = 0;
-    state.write_idx = 0;
+    state.rdwr_idx = 0;
 }
 
 #ifdef USE_SPLICE
@@ -217,7 +218,7 @@ static void debug_all_data(
         // TODO: this is problematic, as a mysql dump INSERT line can
         // easily span >1MB. either we need more buffer, or we'll want
         // to print some values in between anyway.
-        if (!first || pfmt == P_FULL) {
+        if (!first || pfmt == P_FULL || 1) {
             fprintf(
                 stderr, CSI_EL "textpv: > %s%.*s%s\n", (first ? "... " : ""),
                 linelen, p, (trimmed ? " ..." : ""));
@@ -236,83 +237,70 @@ static const char *human_speed(off_t bps) {
     } else if (bps > (1024L)) {
         snprintf(buf, 20, "%.1f KiB/s", ((double)bps) / 1024);
     } else {
-        snprintf(buf, 20, "%zd B/s", bps);
+        snprintf(buf, 20, "%d B/s", (unsigned)bps);
     }
     return buf;
 }
 
 static void print_read_write_state(enum print_format pfmt) {
-    static off_t last_written;
-    static struct timeval tprev;
+    static struct timeval t0;
+    struct timeval tnow;
+    unsigned i;
 
-    const struct buffer_t *buf0, *buf1; /* but the FDs are mutable */
-    char data[BUFFER_SIZE * 2];
+    char data[BUFFER_SIZE * BUFFERS]; /* 16 * 128K == 2M */
     unsigned size;
 
-    if (tprev.tv_sec == 0 && tprev.tv_usec == 0) {
-        gettimeofday(&tprev, NULL); /* assume this cannot fail */
-        assert(tprev.tv_sec != 0 || tprev.tv_usec != 0);
+    unsigned time_delta_ms;
+    off_t speed;
+
+    if (t0.tv_sec == 0 && t0.tv_usec == 0) {
+        gettimeofday(&t0, NULL); /* assume this cannot fail */
+        assert(t0.tv_sec != 0 || t0.tv_usec != 0);
     }
 
-    if (unlikely(state.buffers[0].bytes_read == state.buffers[1].bytes_read)) {
-        fprintf(stderr, CSI_EL "textpv: nothing written yet\n");
-        return;
-    }
-    if (state.buffers[0].bytes_read > state.buffers[1].bytes_read) {
-        buf0 = &state.buffers[1];
-        buf1 = &state.buffers[0];
-    } else {
-        buf0 = &state.buffers[0];
-        buf1 = &state.buffers[1];
-    }
+    /* We're always at state.rdwr_idx first. Either it was _just_
+     * read from (first of the buffers), or it was just written to (last
+     * of the buffers). We've ensured that if it was just written to,
+     * the size is still 0 until rdwr_idx is incremented. So we won't
+     * read a newest read buffer in the wrong order. */
+    // TODO: move this to a function
+    size = 0;
+    for (i = 0; i < BUFFERS; ++i) {
+        const struct buffer_t *buf; /* although fds are mutable */
+        unsigned idx = (state.rdwr_idx + i) % BUFFERS;
+        buf = &state.buffers[idx];
 #ifdef USE_SPLICE
-    size = pipe_peek(buf0->pipe_r, buf0->pipe_w, data, buf0->size);
-    size += pipe_peek(buf1->pipe_r, buf1->pipe_w, data + size, buf1->size);
+        size += pipe_peek(buf->pipe_r, buf->pipe_w, data, buf->size);
 #else
-    memcpy(data, buf0->data, buf0->size);
-    memcpy(data + buf0->size, buf1->data, buf1->size);
-    size = buf0->size + buf1->size;
+        memcpy(data + size, buf->data, buf->size);
+        size += buf->size;
 #endif
-    /* We cannot tell here whether we've written buf0 and buf1 already.
-     * If we have two full buffers, buf0 may or may not have been
-     * written already. But buf1 should still be ours alone. (Except
-     * when we're at the end and we're flushing both buffers.) */
-    {
-        off_t bytes_read = buf1->bytes_read;
-        off_t bytes_written = state.bytes_written;
-        off_t bytes_written_d = (bytes_written - last_written);
-        unsigned time_d;
-        off_t speed;
-        struct timeval tnow;
-        gettimeofday(&tnow, NULL); /* assume this cannot fail */
-        assert(tnow.tv_sec != 0 || tnow.tv_usec != 0);
-        time_d = (
-            (tnow.tv_sec - tprev.tv_sec) * 1000 +
-            (tnow.tv_usec - tprev.tv_usec) / 1000);
-        if (time_d) {
-            speed = (bytes_written_d * 1000 / time_d);
-        } else {
-            speed = 0;
-        }
-
-        assert(bytes_written <= bytes_read);
-        // fprintf(stderr, "[[[ %.*s ]]]\n", size, data);
-        // lfs = count_lfs(buf1)
-        // fprintf(
-        //     stderr, "we have buf0 %zu size %u and buf1 %zu size %u\n",
-        //     buf0->bytes_read, buf0->size, buf1->bytes_read, buf1->size);
-        debug_all_data(pfmt, data, size);
-        fprintf(
-            stderr,
-            CSI_EL "textpv: %zu+ (0x%zx) bytes written, "
-            "%zu+ (0x%zx) bytes read (delta 0x%zx), curbuf 0x%x, %s\r",
-            bytes_written, bytes_written, bytes_read, bytes_read,
-            (bytes_read - bytes_written), size, human_speed(speed));
     }
+
+    /* Verbose printing of at least one line. */
+    debug_all_data(pfmt, data, size);
+
+    gettimeofday(&tnow, NULL); /* assume this cannot fail */
+    assert(tnow.tv_sec != 0 || tnow.tv_usec != 0);
+    time_delta_ms = (
+        (tnow.tv_sec - t0.tv_sec) * 1000 +
+        (tnow.tv_usec - t0.tv_usec) / 1000);
+    if (time_delta_ms) {
+        speed = (state.bytes_written * 1000 / time_delta_ms);
+    } else {
+        speed = 0;
+    }
+
+    fprintf(
+        stderr,
+        CSI_EL "textpv: %zu..%zu (0x%zx) bytes, %s\r",
+        state.bytes_written, state.bytes_read, state.bytes_written,
+        human_speed(speed));
 }
 
 static void read_abort() {
     int error = errno;
+    fprintf(stderr, "\n");
     if (close(STDOUT_FILENO) != 0) {
         perror(CSI_EL "textpv: close(STDOUT_FILENO)");
     }
@@ -326,6 +314,7 @@ static void read_abort() {
 
 static void write_abort() {
     int error = errno;
+    fprintf(stderr, "\n");
     if (close(STDIN_FILENO) != 0) {
         perror(CSI_EL "textpv: close(STDIN_FILENO)");
     }
@@ -337,97 +326,101 @@ static void write_abort() {
     exit(2);
 }
 
-static int fill_one_buffer(struct buffer_t *buf, off_t *bytes) {
-    unsigned off = 0;
-    buf->size = 0; /* if size is zero; don't show */
-    do {
+static unsigned fill_one_buffer(struct buffer_t *buf, off_t *bytes) {
+    ssize_t size;
 #ifdef USE_SPLICE
-        ssize_t size = splice(STDIN_FILENO, NULL, buf->pipe_w, NULL,
-            BUFFER_SIZE - off, SPLICE_F_MORE | SPLICE_F_MOVE);
+    /* We'll splice() once and don't attempt to fill the entire buffer.
+     * This failed when reading ( cat FILE1 FILE2 ) from stdin: splice()
+     * blocked. */
+    size = splice(STDIN_FILENO, NULL, buf->pipe_w, NULL,
+        BUFFER_SIZE, SPLICE_F_MORE | SPLICE_F_MOVE);
 #else
-        ssize_t size = read(
-            STDIN_FILENO, buf->data + off, BUFFER_SIZE - off);
+    /* For non-splice data, we now mark that this data is overwritten. */
+    buf->oldsize = 0;
+    /* Instead of doing a "safe read" and filling the buffer to the
+     * brim, we'll just do this one read. This is mandatory for the
+     * splice() method and no less performant for the read() method. */
+    size = read(STDIN_FILENO, buf->data, BUFFER_SIZE);
 #endif
-        if (unlikely(size < 0)) {
-            read_abort();
-            return 0;
-        }
-        if (unlikely(size == 0)) {
-            buf->size = off;
-            return 0;
-        }
-        off += size;
-#if 0
-        /* This does not work for some inputs. For instance ( cat x y )
-         * in stdin. That will keep restarting the splice()
-         * (ERESTARTSYS) on the boundary of x and y while not proceeding. */
-        if (likely(off == BUFFER_SIZE)) {
-            *bytes += off;
-            buf->bytes_read = *bytes;
-            buf->size = off; /* make size non-zero _after_ setting bytes_read */
-            return 1;
-        }
-        assert(0); /* this fails in some cases; do not use this code */
-#else
-        /* Normally, we'll get a decent sized chunk (64k), and for the
-         * last few bytes of a file it might be less. But there may be
-         * more to come for a new input pipe. (Relevant for splice()
-         * only, but the read() code is not negatively impacted.) */
-        *bytes += off;
-        buf->bytes_read = *bytes;
-        buf->size = off; /* make size non-zero _after_ setting bytes_read */
-        return 1;
+    if (unlikely(size < 0)) {
+        read_abort();
+        return 0;
+    }
+    if (unlikely(size == 0)) {
+        return 0;
+    }
+    *bytes += size;
+#ifndef USE_SPLICE
+    /* We can keep the buffer for a short while before we're filling it
+     * anew. Use this to find the last data that we pushed before an
+     * EPIPE. */
+    buf->oldsize = size;
 #endif
-    } while (1);
+    return size;
 }
 
 static void empty_one_buffer(struct buffer_t *buf, off_t *bytes) {
     unsigned off = 0;
     unsigned to_write = buf->size;
     assert(to_write != 0);
-    do {
+    while (1) {
 #ifdef USE_SPLICE
         ssize_t size = splice(buf->pipe_r, NULL, STDOUT_FILENO, NULL,
             BUFFER_SIZE - off, SPLICE_F_MORE | SPLICE_F_MOVE);
-        if (likely(size >= 0)) {
-            buf->size -= size; /* no point in reading from an empty pipe */
-        }
 #else
         ssize_t size = write(
             STDOUT_FILENO, buf->data + off, to_write - off);
 #endif
         if (unlikely(size <= 0)) {
-            *bytes += off;
             write_abort();
             return;
         }
+        buf->size -= size; /* makes buf->size 0 when done */
         off += size;
+        *bytes += size;
         if (likely(off == to_write)) {
-            *bytes += off;
+            assert(buf->size == 0);
             return;
         }
-    } while (1);
+    }
 }
 
 static void passthrough() {
-    if (likely(fill_one_buffer(
-            &state.buffers[state.read_idx], &state.bytes_read))) {
-        state.read_idx = 1;
-        while (likely(fill_one_buffer(
-                &state.buffers[state.read_idx], &state.bytes_read))) {
-            empty_one_buffer(
-                &state.buffers[state.write_idx], &state.bytes_written);
-            state.read_idx = !state.read_idx;
-            state.write_idx = !state.write_idx;
+    unsigned read;
+    unsigned i;
+
+    /* Step 1: fill all buffers */
+    for (i = 0; i < BUFFERS; ++i) {
+        read = fill_one_buffer(&state.buffers[i], &state.bytes_read);
+        state.buffers[i].size = read;
+        if (unlikely(read == 0)) {
+            goto empty_all_buffers;
         }
-        empty_one_buffer(
-            &state.buffers[state.write_idx], &state.bytes_written);
-        state.write_idx = !state.write_idx;
     }
-    if (state.buffers[state.write_idx].size != 0) {
-        empty_one_buffer(
-            &state.buffers[state.write_idx], &state.bytes_written);
+
+    /* Step 2: empty one buffer, fill that, select next */
+    while (1) {
+        unsigned cur_idx = state.rdwr_idx;
+        empty_one_buffer(&state.buffers[cur_idx], &state.bytes_written);
+        read = fill_one_buffer(&state.buffers[cur_idx], &state.bytes_read);
+
+        /* We update the rdwr_idx _before_ setting the size. That means
+         * that rdwr always points to size 0 or the first data to read. */
+        state.rdwr_idx = (state.rdwr_idx + 1) % BUFFERS;
+        state.buffers[cur_idx].size = read;
+        if (unlikely(read == 0)) {
+            break;
+        }
     }
+
+empty_all_buffers:
+    /* Step 3: empty all leftover buffers */
+    while (state.buffers[state.rdwr_idx].size) {
+        empty_one_buffer(
+            &state.buffers[state.rdwr_idx], &state.bytes_written);
+        state.rdwr_idx = (state.rdwr_idx + 1) % BUFFERS;
+    }
+    assert(state.bytes_written == state.bytes_read);
 }
 
 static void finish() {
@@ -456,7 +449,7 @@ static void show_summary() {
         fprintf(stderr, CSI_EL "textpv: %zu bytes\n", state.bytes_written);
     }
 #else
-    fprintf(stderr, CSI_EL "textpv: %zu bytes\n", state.bytes);
+    fprintf(stderr, CSI_EL "textpv: %zu bytes\n", state.bytes_written);
 #endif
 }
 
@@ -477,8 +470,10 @@ int main() {
 
     passthrough();
     finish();
+    fprintf(stderr, "\n");
 
     // TODO: write_last_bytes/buffers to some tempfile..
+    // TODO: we can mem/peek the buffers as soon as we detect EOF
     print_read_write_state(P_FULL);
     show_summary();
     return 0;
