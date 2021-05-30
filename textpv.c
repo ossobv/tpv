@@ -22,6 +22,8 @@
 # include <fcntl.h>
 #endif
 
+#define CSI_EL "\x1b[K" /* erase from cursor to end of line */
+
 #define BUFFER_SIZE (128L * 1024L)
 
 #define likely(x)   __builtin_expect((x), 1)
@@ -48,6 +50,11 @@ struct state_t {
 
 struct state_t state;
 
+enum print_format {
+    P_SHORT,
+    P_FULL
+};
+
 static void on_alarm(int);
 static void on_pipe(int);
 
@@ -55,18 +62,18 @@ static void setup_signals() {
     struct itimerval tv;
 
     if (signal(SIGPIPE, on_pipe) != 0) {
-        perror("textpv: signal(SIGPIPE)");
+        perror(CSI_EL "textpv: signal(SIGPIPE)");
         exit(1);
     }
 
     if (signal(SIGALRM, on_alarm) != 0) {
-        perror("textpv: signal(SIGALRM)");
+        perror(CSI_EL "textpv: signal(SIGALRM)");
         exit(1);
     }
     tv.it_value.tv_sec = tv.it_interval.tv_sec = 0;
-    tv.it_value.tv_usec = tv.it_interval.tv_usec = 250000;
+    tv.it_value.tv_usec = tv.it_interval.tv_usec = 999999;
     if (setitimer(ITIMER_REAL, &tv, NULL) != 0) {
-        perror("textpv: setitimer");
+        perror(CSI_EL "textpv: setitimer");
         exit(1);
     }
 }
@@ -77,12 +84,12 @@ static void setup_state() {
         int pipes[2];
         if (isatty(STDOUT_FILENO)) {
             fprintf(
-                stderr, "textpv: splice() will not work on stdout; "
+                stderr, CSI_EL "textpv: splice() will not work on stdout; "
                 "please pipe this to something\n");
             exit(1);
         }
         if (pipe(pipes) != 0) {
-            perror("textpv: pipe");
+            perror(CSI_EL "textpv: pipe");
             exit(1);
         }
         state.buffers[buf_idx].pipe_r = pipes[0];
@@ -96,7 +103,7 @@ static void setup_state() {
         if (fcntl(
                 state.buffers[buf_idx].pipe_w, F_SETPIPE_SZ,
                 BUFFER_SIZE) < BUFFER_SIZE) {
-            perror("textpv: fcntl(F_SETPIPE_SZ)");
+            perror(CSI_EL "textpv: fcntl(F_SETPIPE_SZ)");
             exit(1);
         }
 #endif
@@ -121,7 +128,7 @@ static unsigned safe_read(int fd, char *dest, ssize_t size) {
         do {
             pollret = poll(&pfd, 1, 0);
             if (unlikely(pollret < 0) && errno != EINTR) {
-                perror("textpv: poll");
+                perror(CSI_EL "textpv: poll");
                 exit(1);
             }
         } while (pollret < 0);
@@ -138,7 +145,7 @@ static unsigned safe_read(int fd, char *dest, ssize_t size) {
             return off;
         }
         if (unlikely(ret <= 0)) {
-            perror("textpv: safe_read");
+            perror(CSI_EL "textpv: safe_read");
             exit(1);
         }
         size -= ret;
@@ -154,7 +161,7 @@ static void safe_write(int fd, const char *source, ssize_t size) {
             return;
         }
         if (unlikely(ret <= 0)) {
-            perror("textpv: safe_write");
+            perror(CSI_EL "textpv: safe_write");
             exit(1);
         }
         size -= ret;
@@ -177,12 +184,78 @@ static unsigned pipe_peek(int pipe_r, int pipe_w, char *buf, unsigned size) {
 }
 #endif
 
-static void print_read_write_state() {
+static void debug_all_data(
+        enum print_format pfmt, const char *data, unsigned size) {
+    unsigned lfs = 0;
+    unsigned first = 1;
+    unsigned trimmed;
+
+    const char *p = data;
+    const char *pe = data + size;
+    while (p != pe) {
+        lfs += (*p++ == '\n');
+    }
+    p = data;
+    while (p != pe) {
+        const char *lf = p;
+        unsigned linelen;
+        while (lf != pe) {
+            if (*lf++ == '\n')
+                break;
+        }
+        --lf; /* at LF or at (pe - 1) */
+        linelen = (lf - p);
+        // TODO: no printing of control chars..
+        // TODO: print special if lf == pe
+        if (linelen > 72) {
+            trimmed = 1;
+            linelen = 72;
+        } else {
+            trimmed = 0;
+        }
+        // TODO: only print if first??
+        // TODO: this is problematic, as a mysql dump INSERT line can
+        // easily span >1MB. either we need more buffer, or we'll want
+        // to print some values in between anyway.
+        if (!first || pfmt == P_FULL) {
+            fprintf(
+                stderr, CSI_EL "textpv: > %s%.*s%s\n", (first ? "... " : ""),
+                linelen, p, (trimmed ? " ..." : ""));
+        }
+        p = lf + 1;
+        first = 0;
+    }
+}
+
+static const char *human_speed(off_t bps) {
+    static char buf[20];
+    if (bps > (1024L * 1024L * 1024L)) {
+        snprintf(buf, 20, "%.1f GiB/s", ((double)bps) / 1024 / 1024 / 1024);
+    } else if (bps > (1024L * 1024L)) {
+        snprintf(buf, 20, "%.1f MiB/s", ((double)bps) / 1024 / 1024);
+    } else if (bps > (1024L)) {
+        snprintf(buf, 20, "%.1f KiB/s", ((double)bps) / 1024);
+    } else {
+        snprintf(buf, 20, "%zd B/s", bps);
+    }
+    return buf;
+}
+
+static void print_read_write_state(enum print_format pfmt) {
+    static off_t last_written;
+    static struct timeval tprev;
+
     const struct buffer_t *buf0, *buf1; /* but the FDs are mutable */
     char data[BUFFER_SIZE * 2];
     unsigned size;
+
+    if (tprev.tv_sec == 0 && tprev.tv_usec == 0) {
+        gettimeofday(&tprev, NULL); /* assume this cannot fail */
+        assert(tprev.tv_sec != 0 || tprev.tv_usec != 0);
+    }
+
     if (unlikely(state.buffers[0].bytes_read == state.buffers[1].bytes_read)) {
-        fprintf(stderr, "textpv: nothing written yet\n");
+        fprintf(stderr, CSI_EL "textpv: nothing written yet\n");
         return;
     }
     if (state.buffers[0].bytes_read > state.buffers[1].bytes_read) {
@@ -200,40 +273,67 @@ static void print_read_write_state() {
     memcpy(data + buf0->size, buf1->data, buf1->size);
     size = buf0->size + buf1->size;
 #endif
-    // fprintf(stderr, "[[[ %.*s ]]]\n", size, data);
-    // lfs = count_lfs(buf1)
-    // fprintf(
-    //     stderr, "we have buf0 %zu size %u and buf1 %zu size %u\n",
-    //     buf0->bytes_read, buf0->size, buf1->bytes_read, buf1->size);
-    fprintf(
-        stderr,
-        "textpv: at least %zu (0x%zx) bytes written, curbuf %u\n",
-        state.bytes_written, state.bytes_written, size);
+    /* We cannot tell here whether we've written buf0 and buf1 already.
+     * If we have two full buffers, buf0 may or may not have been
+     * written already. But buf1 should still be ours alone. (Except
+     * when we're at the end and we're flushing both buffers.) */
+    {
+        off_t bytes_read = buf1->bytes_read;
+        off_t bytes_written = state.bytes_written;
+        off_t bytes_written_d = (bytes_written - last_written);
+        unsigned time_d;
+        off_t speed;
+        struct timeval tnow;
+        gettimeofday(&tnow, NULL); /* assume this cannot fail */
+        assert(tnow.tv_sec != 0 || tnow.tv_usec != 0);
+        time_d = (
+            (tnow.tv_sec - tprev.tv_sec) * 1000 +
+            (tnow.tv_usec - tprev.tv_usec) / 1000);
+        if (time_d) {
+            speed = (bytes_written_d * 1000 / time_d);
+        } else {
+            speed = 0;
+        }
+
+        assert(bytes_written <= bytes_read);
+        // fprintf(stderr, "[[[ %.*s ]]]\n", size, data);
+        // lfs = count_lfs(buf1)
+        // fprintf(
+        //     stderr, "we have buf0 %zu size %u and buf1 %zu size %u\n",
+        //     buf0->bytes_read, buf0->size, buf1->bytes_read, buf1->size);
+        debug_all_data(pfmt, data, size);
+        fprintf(
+            stderr,
+            CSI_EL "textpv: %zu+ (0x%zx) bytes written, "
+            "%zu+ (0x%zx) bytes read (delta 0x%zx), curbuf 0x%x, %s\r",
+            bytes_written, bytes_written, bytes_read, bytes_read,
+            (bytes_read - bytes_written), size, human_speed(speed));
+    }
 }
 
 static void read_abort() {
     int error = errno;
     if (close(STDOUT_FILENO) != 0) {
-        perror("textpv: close(STDOUT_FILENO)");
+        perror(CSI_EL "textpv: close(STDOUT_FILENO)");
     }
 
-    print_read_write_state();
+    print_read_write_state(P_FULL);
 
     errno = error;
-    perror("textpv: read error");
+    perror(CSI_EL "textpv: read error");
     exit(4);
 }
 
 static void write_abort() {
     int error = errno;
     if (close(STDIN_FILENO) != 0) {
-        perror("textpv: close(STDIN_FILENO)");
+        perror(CSI_EL "textpv: close(STDIN_FILENO)");
     }
 
-    print_read_write_state();
+    print_read_write_state(P_FULL);
 
     errno = error;
-    perror("textpv: write error");
+    perror(CSI_EL "textpv: write error");
     exit(2);
 }
 
@@ -289,6 +389,9 @@ static void empty_one_buffer(struct buffer_t *buf, off_t *bytes) {
 #ifdef USE_SPLICE
         ssize_t size = splice(buf->pipe_r, NULL, STDOUT_FILENO, NULL,
             BUFFER_SIZE - off, SPLICE_F_MORE | SPLICE_F_MOVE);
+        if (likely(size >= 0)) {
+            buf->size -= size; /* no point in reading from an empty pipe */
+        }
 #else
         ssize_t size = write(
             STDOUT_FILENO, buf->data + off, to_write - off);
@@ -331,10 +434,10 @@ static void finish() {
     /* Close STDIN/STDOUT so we don't fail just because we're doing
      * stuff at summary time. */
     if (close(STDOUT_FILENO) != 0) {
-        perror("textpv: close(STDOUT_FILENO)");
+        perror(CSI_EL "textpv: close(STDOUT_FILENO)");
     }
     if (close(STDIN_FILENO) != 0) {
-        perror("textpv: close(STDIN_FILENO)");
+        perror(CSI_EL "textpv: close(STDIN_FILENO)");
     }
 }
 
@@ -344,21 +447,21 @@ static void show_summary() {
     if (getrusage(RUSAGE_SELF, &ru) == 0) {
         fprintf(
             stderr,
-            "textpv: %zu bytes, %zu.%02zu utime, %zu.%02zu stime\n",
+            CSI_EL "textpv: %zu bytes, %zu.%02zu utime, %zu.%02zu stime\n",
             state.bytes_written,
             ru.ru_utime.tv_sec, (ru.ru_utime.tv_usec + 5000) / 10000,
             ru.ru_stime.tv_sec, (ru.ru_stime.tv_usec + 5000) / 10000);
     } else {
-        perror("textpv: getrusage");
-        fprintf(stderr, "textpv: %zu bytes\n", state.bytes_written);
+        perror(CSI_EL "textpv: getrusage");
+        fprintf(stderr, CSI_EL "textpv: %zu bytes\n", state.bytes_written);
     }
 #else
-    fprintf(stderr, "textpv: %zu bytes\n", state.bytes);
+    fprintf(stderr, CSI_EL "textpv: %zu bytes\n", state.bytes);
 #endif
 }
 
 static void on_alarm(int signum) {
-    print_read_write_state();
+    print_read_write_state(P_SHORT);
 }
 
 static void on_pipe(int signum) {
@@ -376,6 +479,7 @@ int main() {
     finish();
 
     // TODO: write_last_bytes/buffers to some tempfile..
+    print_read_write_state(P_FULL);
     show_summary();
     return 0;
 }
