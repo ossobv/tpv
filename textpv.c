@@ -74,6 +74,12 @@ static void setup_state() {
     for (unsigned buf_idx = 0; buf_idx < 2; ++buf_idx) {
 #ifdef USE_SPLICE
         int pipes[2];
+        if (isatty(STDOUT_FILENO)) {
+            fprintf(
+                stderr, "textpv: splice() will not work on stdout; "
+                "please pipe this to something\n");
+            exit(1);
+        }
         if (pipe(pipes) != 0) {
             perror("textpv: pipe");
             exit(1);
@@ -124,6 +130,7 @@ static void write_abort() {
 
 static int fill_one_buffer(struct buffer_t *buf, off_t *bytes) {
     unsigned off = 0;
+    buf->size = 0; /* if size is zero; don't show */
     do {
 #ifdef USE_SPLICE
         ssize_t size = splice(STDIN_FILENO, NULL, buf->pipe_w, NULL,
@@ -141,9 +148,27 @@ static int fill_one_buffer(struct buffer_t *buf, off_t *bytes) {
             return 0;
         }
         off += size;
+#if 0
+        /* This does not work for some inputs. For instance ( cat x y )
+         * in stdin. That will keep restarting the splice()
+         * (ERESTARTSYS) on the boundary of x and y while not proceeding. */
         if (likely(off == BUFFER_SIZE)) {
+            *bytes += off;
+            buf->bytes_read = *bytes;
+            buf->size = off; /* make size non-zero _after_ setting bytes_read */
             return 1;
         }
+        assert(0); /* this fails in some cases; do not use this code */
+#else
+        /* Normally, we'll get a decent sized chunk (64k), and for the
+         * last few bytes of a file it might be less. But there may be
+         * more to come for a new input pipe. (Relevant for splice()
+         * only, but the read() code is not negatively impacted.) */
+        *bytes += off;
+        buf->bytes_read = *bytes;
+        buf->size = off; /* make size non-zero _after_ setting bytes_read */
+        return 1;
+#endif
     } while (1);
 }
 
@@ -225,9 +250,6 @@ static void show_summary() {
 
 static void on_alarm(int signum) {
     fprintf(stderr, "textpv: %zu bytes\n", state.bytes_written);
-#ifdef USE_SPLICE
-    assert(0); /* broken for splice; may hang */
-#endif
 }
 
 static void on_pipe(int signum) {
