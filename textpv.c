@@ -59,21 +59,38 @@ static void on_alarm(int);
 static void on_pipe(int);
 
 static void setup_signals() {
+    struct sigaction setup_action;
+    sigset_t block_signals;
     struct itimerval tv;
 
-    if (signal(SIGPIPE, on_pipe) != 0) {
-        perror(CSI_EL "textpv: signal(SIGPIPE)");
+    /* Do we want to block other signals? Or just PIPE and ALRM? */
+#if 0
+    sigfillset(&block_signals);
+#else
+    sigaddset(&block_signals, SIGALRM);
+    sigaddset(&block_signals, SIGPIPE);
+#endif
+
+    /* Block other signals while handler runs. */
+    setup_action.sa_mask = block_signals;
+    setup_action.sa_flags = SA_RESTART; /* handle EINTR in kernel */
+
+    setup_action.sa_handler = on_pipe;
+    if (sigaction(SIGPIPE, &setup_action, NULL) != 0) {
+        perror("\ntextpv: sigaction(SIGPIPE)");
         exit(1);
     }
 
-    if (signal(SIGALRM, on_alarm) != 0) {
-        perror(CSI_EL "textpv: signal(SIGALRM)");
+    setup_action.sa_handler = on_alarm;
+    if (sigaction(SIGALRM, &setup_action, NULL) != 0) {
+        perror("\ntextpv: sigaction(SIGALRM)");
         exit(1);
     }
+
     tv.it_value.tv_sec = tv.it_interval.tv_sec = 0;
     tv.it_value.tv_usec = tv.it_interval.tv_usec = 999999;
     if (setitimer(ITIMER_REAL, &tv, NULL) != 0) {
-        perror(CSI_EL "textpv: setitimer");
+        perror("\ntextpv: setitimer");
         exit(1);
     }
 }
