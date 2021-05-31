@@ -24,13 +24,20 @@
 
 #define CSI_EL "\x1b[K" /* erase from cursor to end of line */
 
-#define BUFFER_SIZE (128L * 1024L)
-#define BUFFERS 16 /* 16 * 128K == 2M */
+#ifdef USE_SPLICE
+# define BUFFER_SIZE (128L * 1024L)
+# define BUFFERS 256 /* 256 * 8K == 2M, but we prefer 64+K buffers */
+#else
+/* TODO: backlog buffer so we can print what we've been doing */
+# define BUFFER_SIZE (128L * 1024L)
+# define BUFFERS 16 /* 16 * 128K == 2M */
+#endif
 
 #define likely(x)   __builtin_expect((x), 1)
 #define unlikely(x) __builtin_expect((x), 0)
 
 struct buffer_t {
+    off_t pos;
     unsigned size;
 #ifdef USE_SPLICE
     int pipe_r;
@@ -128,6 +135,7 @@ static void setup_state() {
 #endif
         state.buffers[rdwr_idx].size = 0;
     }
+    state.bytes_read = 0;
     state.bytes_written = 0;
     state.rdwr_idx = 0;
 }
@@ -150,10 +158,12 @@ static unsigned safe_read(int fd, char *dest, ssize_t size) {
                 exit(1);
             }
         } while (pollret < 0);
-        if (pollret == 0) {
-            /* Aborting sooner than expected. Maybe someone has read the
-             * pipe already. The worst thing we can do is block at this
-             * point. Return now. */
+
+        if (unlikely(pollret == 0)) {
+            /* Because empty_one_buffer() sets the size to 0 first
+             * _after_ reading, we may end up here after that read, but
+             * before we see a 0-size. In that case there is nothing to
+             * read. Moving on. */
             return off;
         }
 
@@ -203,7 +213,7 @@ static unsigned pipe_peek(int pipe_r, int pipe_w, char *buf, unsigned size) {
 #endif
 
 static void debug_all_data(
-        enum print_format pfmt, const char *data, unsigned size) {
+        enum print_format pfmt, char *data, unsigned size, off_t pos) {
     unsigned lfs = 0;
     unsigned first = 1;
     unsigned trimmed;
@@ -232,13 +242,13 @@ static void debug_all_data(
             trimmed = 0;
         }
         // TODO: only print if first??
-        // TODO: this is problematic, as a mysql dump INSERT line can
-        // easily span >1MB. either we need more buffer, or we'll want
-        // to print some values in between anyway.
-        if (!first || pfmt == P_FULL || 1) {
+        // TODO: as a mysql dump INSERT line can easily span >1MB,
+        // we need a big buffer (many pipes or big data buffers).
+        if (!first || pfmt == P_FULL) {
             fprintf(
-                stderr, CSI_EL "textpv: > %s%.*s%s\n", (first ? "... " : ""),
-                linelen, p, (trimmed ? " ..." : ""));
+                stderr, CSI_EL "textpv: [%08zx] %s%.*s%s\n",
+                pos + (p - data),
+                (first ? "... " : ""), linelen, p, (trimmed ? " ..." : ""));
         }
         p = lf + 1;
         first = 0;
@@ -264,7 +274,8 @@ static void print_read_write_state(enum print_format pfmt) {
     struct timeval tnow;
     unsigned i;
 
-    char data[BUFFER_SIZE * BUFFERS]; /* 16 * 128K == 2M */
+    off_t pos;
+    char data[3L * 1024L * 2024L]; /* 2M + some extra room */
     unsigned size;
 
     unsigned time_delta_ms;
@@ -281,12 +292,14 @@ static void print_read_write_state(enum print_format pfmt) {
      * the size is still 0 until rdwr_idx is incremented. So we won't
      * read a newest read buffer in the wrong order. */
     // TODO: move this to a function
+    pos = (off_t)-1;
     size = 0;
     for (i = 0; i < BUFFERS; ++i) {
         const struct buffer_t *buf; /* although fds are mutable */
         unsigned idx = (state.rdwr_idx + i) % BUFFERS;
         unsigned read;
         buf = &state.buffers[idx];
+        assert(buf->size < (1L * 1024L * 1024L)); /* no overflowing please */
 #ifdef USE_SPLICE
         read = pipe_peek(buf->pipe_r, buf->pipe_w, data + size, buf->size);
 #else
@@ -294,10 +307,17 @@ static void print_read_write_state(enum print_format pfmt) {
         memcpy(data + size, buf->data, read);
 #endif
         size += read;
+        if (unlikely(pos == (off_t)-1 && read != 0)) {
+            pos = buf->pos;
+        }
+        if (unlikely(size >= (2L * 1024L * 1024L))) {
+            size = (2L * 1024L * 1024L);
+            break;
+        }
     }
 
     /* Verbose printing of at least one line. */
-    debug_all_data(pfmt, data, size);
+    debug_all_data(pfmt, data, size, pos);
 
     gettimeofday(&tnow, NULL); /* assume this cannot fail */
     assert(tnow.tv_sec != 0 || tnow.tv_usec != 0);
@@ -346,21 +366,20 @@ static void write_abort() {
 }
 
 static unsigned fill_one_buffer(struct buffer_t *buf, off_t *bytes) {
+#ifndef USE_SPLICE
+    off_t off = 0;
+#endif
     ssize_t size;
+
+    buf->pos = *bytes;
+
 #ifdef USE_SPLICE
     /* We'll splice() once and don't attempt to fill the entire buffer.
      * This failed when reading ( cat FILE1 FILE2 ) from stdin: splice()
      * blocked. */
     size = splice(STDIN_FILENO, NULL, buf->pipe_w, NULL,
         BUFFER_SIZE, SPLICE_F_MORE | SPLICE_F_MOVE);
-#else
-    /* For non-splice data, we now mark that this data is overwritten. */
-    buf->oldsize = 0;
-    /* Instead of doing a "safe read" and filling the buffer to the
-     * brim, we'll just do this one read. This is mandatory for the
-     * splice() method and no less performant for the read() method. */
-    size = read(STDIN_FILENO, buf->data, BUFFER_SIZE);
-#endif
+
     if (unlikely(size < 0)) {
         read_abort();
         return 0;
@@ -369,11 +388,28 @@ static unsigned fill_one_buffer(struct buffer_t *buf, off_t *bytes) {
         return 0;
     }
     *bytes += size;
-#ifndef USE_SPLICE
-    /* We can keep the buffer for a short while before we're filling it
-     * anew. Use this to find the last data that we pushed before an
-     * EPIPE. */
-    buf->oldsize = size;
+#else
+    /* For non-splice data, we now mark that this data is overwritten. */
+    buf->oldsize = 0;
+    /* We'll do a "safe read" and fill the buffer to the brim. Otherwise
+     * will get possibly tiny chunks fed to us, depending on the source
+     * application. */
+    while (1) {
+        size = read(STDIN_FILENO, buf->data + off, BUFFER_SIZE - off);
+        if (unlikely(size < 0)) {
+            read_abort();
+            return 0;
+        }
+        off += size;
+        *bytes += size;
+        if (unlikely(size == 0 || off == BUFFER_SIZE)) {
+            /* We can keep the buffer for a short while before we're filling it
+             * anew. Use this to find the last data that we pushed before an
+             * EPIPE. */
+            buf->oldsize = off;
+            return off;
+        }
+    }
 #endif
     return size;
 }
