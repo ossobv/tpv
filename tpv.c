@@ -124,20 +124,20 @@ static void setup_signals() {
 
     setup_action.sa_handler = on_pipe;
     if (sigaction(SIGPIPE, &setup_action, NULL) != 0) {
-        perror("\ntextpv: sigaction(SIGPIPE)");
+        perror("\ntpv: sigaction(SIGPIPE)");
         exit(1);
     }
 
     setup_action.sa_handler = on_alarm;
     if (sigaction(SIGALRM, &setup_action, NULL) != 0) {
-        perror("\ntextpv: sigaction(SIGALRM)");
+        perror("\ntpv: sigaction(SIGALRM)");
         exit(1);
     }
 
     tv.it_value.tv_sec = tv.it_interval.tv_sec = 0;
     tv.it_value.tv_usec = tv.it_interval.tv_usec = 999999;
     if (setitimer(ITIMER_REAL, &tv, NULL) != 0) {
-        perror("\ntextpv: setitimer");
+        perror("\ntpv: setitimer");
         exit(1);
     }
 }
@@ -148,12 +148,12 @@ static void setup_state() {
         int pipes[2];
         if (isatty(STDOUT_FILENO)) {
             fprintf(
-                stderr, CSI_EL "textpv: splice() will not work on stdout; "
+                stderr, "\ntpv: splice() will not work on stdout; "
                 "please pipe this to something\n");
             exit(1);
         }
         if (pipe(pipes) != 0) {
-            perror(CSI_EL "textpv: pipe");
+            perror("\ntpv: pipe");
             exit(1);
         }
         state.buffers[rdwr_idx].pipe_r = pipes[0];
@@ -167,7 +167,7 @@ static void setup_state() {
         if (fcntl(
                 state.buffers[rdwr_idx].pipe_w, F_SETPIPE_SZ,
                 BUFFER_SIZE) < BUFFER_SIZE) {
-            perror(CSI_EL "textpv: fcntl(F_SETPIPE_SZ)");
+            perror("\ntpv: fcntl(F_SETPIPE_SZ)");
             exit(1);
         }
 #else
@@ -194,7 +194,7 @@ static unsigned safe_read(int fd, char *dest, ssize_t size) {
         do {
             pollret = poll(&pfd, 1, 0);
             if (unlikely(pollret < 0) && errno != EINTR) {
-                perror(CSI_EL "textpv: poll");
+                perror("\ntpv: poll");
                 exit(1);
             }
         } while (pollret < 0);
@@ -213,7 +213,7 @@ static unsigned safe_read(int fd, char *dest, ssize_t size) {
             return off;
         }
         if (unlikely(ret <= 0)) {
-            perror(CSI_EL "textpv: safe_read");
+            perror("\ntpv: safe_read");
             exit(1);
         }
         size -= ret;
@@ -229,7 +229,7 @@ static void safe_write(int fd, const char *source, ssize_t size) {
             return;
         }
         if (unlikely(ret <= 0)) {
-            perror(CSI_EL "textpv: safe_write");
+            perror("\ntpv: safe_write");
             exit(1);
         }
         size -= ret;
@@ -261,8 +261,8 @@ static void debug_all_data(
     char *p = data;
     const char *pe = data + size;
 
-    /* Prefix: "textpv: [02f786bc+055«e] " = 26, "... " = 4 */
-    unsigned cols = gettermcols() - 36;
+    /* Prefix: "tpv[02f786bc+055<<e] " = 20, "... " = 2 */
+    unsigned cols = gettermcols() - 26;
 
     while (p != pe) {
         char *lf = p;
@@ -297,7 +297,7 @@ static void debug_all_data(
          * after an LF. With the current config we do. */
         if (!first || pfmt == P_FULL) {
             fprintf(
-                stderr, CSI_EL "textpv: [%08zx+%s] %s%.*s%s\n",
+                stderr, CSI_EL "tpv[%08zx+%s] %s%.*s%s\n",
                 pos + (p - data), human_bufsize(size),
                 (first ? U_ELLIPSIS : ""), linelen, p,
                 (trimmed ? U_ELLIPSIS : ""));
@@ -309,7 +309,7 @@ static void debug_all_data(
         /* Don't print more than N lines. */
         if (lfs >= 80) {
             fprintf(
-                stderr, CSI_EL "textpv: [%08zx+%s] " U_ELLIPSIS "\n",
+                stderr, CSI_EL "tpv[%08zx+%s] " U_ELLIPSIS "\n",
                 pos + (p - data), human_bufsize(size));
             break;
         }
@@ -378,23 +378,21 @@ static void print_read_write_state(enum print_format pfmt) {
     }
 
     fprintf(
-        stderr,
-        CSI_EL "textpv: %zu..%zu (0x%zx) bytes, %s\r",
-        state.bytes_written, state.bytes_read, state.bytes_written,
-        human_speed(speed));
+        stderr, CSI_EL "tpv: %zu (0x%zx) bytes, %s\r",
+        state.bytes_written, state.bytes_written, human_speed(speed));
 }
 
 static void read_abort() {
     int error = errno;
     fprintf(stderr, "\n");
     if (close(STDOUT_FILENO) != 0) {
-        perror(CSI_EL "textpv: close(STDOUT_FILENO)");
+        perror("\ntpv: close(STDOUT_FILENO)");
     }
 
     print_read_write_state(P_FULL);
 
     errno = error;
-    perror(CSI_EL "textpv: read error");
+    perror("\ntpv: read/splice error");
     exit(4);
 }
 
@@ -402,13 +400,13 @@ static void write_abort() {
     int error = errno;
     fprintf(stderr, "\n");
     if (close(STDIN_FILENO) != 0) {
-        perror(CSI_EL "textpv: close(STDIN_FILENO)");
+        perror("\ntpv: close(STDIN_FILENO)");
     }
 
     print_read_write_state(P_FULL);
 
     errno = error;
-    perror(CSI_EL "textpv: write error");
+    perror("\ntpv: write/splice error");
     exit(2);
 }
 
@@ -529,10 +527,10 @@ static void finish() {
     /* Close STDIN/STDOUT so we don't fail just because we're doing
      * stuff at summary time. */
     if (close(STDOUT_FILENO) != 0) {
-        perror(CSI_EL "textpv: close(STDOUT_FILENO)");
+        perror("\ntpv: close(STDOUT_FILENO)");
     }
     if (close(STDIN_FILENO) != 0) {
-        perror(CSI_EL "textpv: close(STDIN_FILENO)");
+        perror("\ntpv: close(STDIN_FILENO)");
     }
 }
 
@@ -541,17 +539,21 @@ static void show_summary() {
     struct rusage ru;
     if (getrusage(RUSAGE_SELF, &ru) == 0) {
         fprintf(
-            stderr,
-            CSI_EL "textpv: %zu bytes, %zu.%02zu utime, %zu.%02zu stime\n",
-            state.bytes_written,
+            stderr, CSI_EL "tpv: %zu (0x%zx) bytes, "
+            "%zu.%02zu utime, %zu.%02zu stime\n",
+            state.bytes_written, state.bytes_written,
             ru.ru_utime.tv_sec, (ru.ru_utime.tv_usec + 5000) / 10000,
             ru.ru_stime.tv_sec, (ru.ru_stime.tv_usec + 5000) / 10000);
     } else {
-        perror(CSI_EL "textpv: getrusage");
-        fprintf(stderr, CSI_EL "textpv: %zu bytes\n", state.bytes_written);
+        perror("\ntpv: getrusage");
+        fprintf(
+            stderr, CSI_EL "tpv: %zu (0x%zx) bytes\n",
+            state.bytes_written, state.bytes_written);
     }
 #else
-    fprintf(stderr, CSI_EL "textpv: %zu bytes\n", state.bytes_written);
+    fprintf(
+        stderr, CSI_EL "tpv: %zu (0x%zx) bytes\n",
+        state.bytes_written, state.bytes_written);
 #endif
 }
 

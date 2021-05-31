@@ -1,14 +1,16 @@
-CFLAGS = -Wall -O3
+CFLAGS = -Wall -O3 -g
 #CPPFLAGS += -DNDEBUG
 CPPFLAGS += -DUSE_RUSAGE
 #CPPFLAGS += -DUSE_SPLICE
 
 .PHONY: all
-all: textpv-read textpv-splice
+all: tpv tpv-read tpv-splice
 
-textpv-read: textpv.c
+tpv:
+	ln -s tpv-read tpv
+tpv-read: tpv.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $^
-textpv-splice: textpv.c
+tpv-splice: tpv.c
 	$(CC) -DUSE_SPLICE $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $^
-textpv.c: Makefile
-	touch textpv.c
+tpv.c: Makefile
+	touch tpv.c
