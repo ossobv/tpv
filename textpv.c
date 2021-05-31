@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -22,7 +23,9 @@
 # include <fcntl.h>
 #endif
 
-#define CSI_EL "\x1b[K" /* erase from cursor to end of line */
+#define CSI_EL "\x1b[K"             /* erase from cursor to end of line */
+#define U_LEFTSHIFT "\xc2\xab"      /* U+00AB */
+#define U_ELLIPSIS "\xe2\x80\xa6"   /* U+2026 */
 
 #ifdef USE_SPLICE
 # define BUFFER_SIZE (128L * 1024L)
@@ -35,6 +38,7 @@
 
 #define likely(x)   __builtin_expect((x), 1)
 #define unlikely(x) __builtin_expect((x), 0)
+
 
 struct buffer_t {
     off_t pos;
@@ -64,6 +68,42 @@ enum print_format {
 
 static void on_alarm(int);
 static void on_pipe(int);
+
+static unsigned gettermcols() {
+    struct winsize ws;
+    unsigned cols = 80; /* safe default */
+    if (ioctl(STDERR_FILENO, TIOCGWINSZ, &ws) == 0
+            && (unsigned)ws.ws_col >= 72) {
+        cols = (unsigned)ws.ws_col;
+    }
+    return cols; /* 72.. */
+}
+
+static const char *human_bufsize(unsigned size) {
+    static char buf[20];
+    unsigned bits = 0;
+    while (((size >> 1) << 1) == size) {
+        size >>= 1;
+        ++bits;
+    }
+    snprintf(buf, 20, "%03x" U_LEFTSHIFT "%x", size, bits);
+    return buf;
+}
+
+static const char *human_speed(off_t bps) {
+    static char buf[20];
+    if (bps > (1024L * 1024L * 1024L)) {
+        snprintf(buf, 20, "%.1f GiB/s", ((double)bps) / 1024 / 1024 / 1024);
+    } else if (bps > (1024L * 1024L)) {
+        snprintf(buf, 20, "%.1f MiB/s", ((double)bps) / 1024 / 1024);
+    } else if (bps > (1024L)) {
+        snprintf(buf, 20, "%.1f KiB/s", ((double)bps) / 1024);
+    } else {
+        snprintf(buf, 20, "%d B/s", (unsigned)bps);
+    }
+    return buf;
+}
+
 
 static void setup_signals() {
     struct sigaction setup_action;
@@ -218,55 +258,62 @@ static void debug_all_data(
     unsigned first = 1;
     unsigned trimmed;
 
-    const char *p = data;
+    char *p = data;
     const char *pe = data + size;
+
+    /* Prefix: "textpv: [02f786bc+055«e] " = 26, "... " = 4 */
+    unsigned cols = gettermcols() - 36;
+
     while (p != pe) {
-        lfs += (*p++ == '\n');
-    }
-    p = data;
-    while (p != pe) {
-        const char *lf = p;
+        char *lf = p;
+        unsigned i;
         unsigned linelen;
         while (lf != pe) {
-            if (*lf++ == '\n')
+            if (*lf++ == '\n') {
+                lfs++;
                 break;
+            }
         }
         --lf; /* at LF or at (pe - 1) */
         linelen = (lf - p);
-        // TODO: no printing of control chars..
-        // TODO: print special if lf == pe
-        if (linelen > 72) {
+
+        /* Limit width */
+        if (linelen > cols) {
             trimmed = 1;
-            linelen = 72;
+            linelen = cols;
         } else {
             trimmed = 0;
         }
-        // TODO: only print if first??
-        // TODO: as a mysql dump INSERT line can easily span >1MB,
-        // we need a big buffer (many pipes or big data buffers).
+
+        /* No control characters (except TAB). */
+        for (i = 0; i < linelen; ++i) {
+            if (unlikely((p[i] < 0x20 || p[i] >= 0x7f) && p[i] != '\t')) {
+                p[i] = '?';
+            }
+        }
+
+        /* Because MySQL SQL files can span up and above 1MB in length,
+         * we need a big enough buffer to only print lines starting
+         * after an LF. With the current config we do. */
         if (!first || pfmt == P_FULL) {
             fprintf(
-                stderr, CSI_EL "textpv: [%08zx] %s%.*s%s\n",
-                pos + (p - data),
-                (first ? "... " : ""), linelen, p, (trimmed ? " ..." : ""));
+                stderr, CSI_EL "textpv: [%08zx+%s] %s%.*s%s\n",
+                pos + (p - data), human_bufsize(size),
+                (first ? U_ELLIPSIS : ""), linelen, p,
+                (trimmed ? U_ELLIPSIS : ""));
         }
+
         p = lf + 1;
         first = 0;
-    }
-}
 
-static const char *human_speed(off_t bps) {
-    static char buf[20];
-    if (bps > (1024L * 1024L * 1024L)) {
-        snprintf(buf, 20, "%.1f GiB/s", ((double)bps) / 1024 / 1024 / 1024);
-    } else if (bps > (1024L * 1024L)) {
-        snprintf(buf, 20, "%.1f MiB/s", ((double)bps) / 1024 / 1024);
-    } else if (bps > (1024L)) {
-        snprintf(buf, 20, "%.1f KiB/s", ((double)bps) / 1024);
-    } else {
-        snprintf(buf, 20, "%d B/s", (unsigned)bps);
+        /* Don't print more than N lines. */
+        if (lfs >= 80) {
+            fprintf(
+                stderr, CSI_EL "textpv: [%08zx+%s] " U_ELLIPSIS "\n",
+                pos + (p - data), human_bufsize(size));
+            break;
+        }
     }
-    return buf;
 }
 
 static void print_read_write_state(enum print_format pfmt) {
