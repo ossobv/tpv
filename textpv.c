@@ -285,13 +285,15 @@ static void print_read_write_state(enum print_format pfmt) {
     for (i = 0; i < BUFFERS; ++i) {
         const struct buffer_t *buf; /* although fds are mutable */
         unsigned idx = (state.rdwr_idx + i) % BUFFERS;
+        unsigned read;
         buf = &state.buffers[idx];
 #ifdef USE_SPLICE
-        size += pipe_peek(buf->pipe_r, buf->pipe_w, data, buf->size);
+        read = pipe_peek(buf->pipe_r, buf->pipe_w, data + size, buf->size);
 #else
-        memcpy(data + size, buf->data, buf->size);
-        size += buf->size;
+        read = buf->size;
+        memcpy(data + size, buf->data, read);
 #endif
+        size += read;
     }
 
     /* Verbose printing of at least one line. */
