@@ -1,4 +1,22 @@
-/* vim: set ts=8 sw=4 sts=4 et ai: */
+/*
+ * Copyright (C) 2021 Walter Doekes, OSSO B.V.
+ *
+ * This file is part of tpv, the Text Piper Viewer.
+ *
+ * tpv is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * tpv is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 #if defined(USE_SPLICE)
 # define _GNU_SOURCE /* splice() and F_SETPIPE_SZ */
 #endif
@@ -31,7 +49,7 @@
 # define BUFFER_SIZE (128L * 1024L)
 # define BUFFERS 256 /* 256 * 8K == 2M, but we prefer 64+K buffers */
 #else
-/* TODO: backlog buffer so we can print what we've been doing */
+/* TODO? backlog buffer so we can print what we've been doing */
 # define BUFFER_SIZE (128L * 1024L)
 # define BUFFERS 16 /* 16 * 128K == 2M */
 #endif
@@ -575,6 +593,7 @@ int main() {
     passthrough();
     finish();
     fprintf(stderr, "\n");
+    // TODO: stop setitimer
 
     // TODO: write_last_bytes/buffers to some tempfile..
     // TODO: we can mem/peek the buffers as soon as we detect EOF
@@ -582,3 +601,5 @@ int main() {
     show_summary();
     return 0;
 }
+
+/* vim: set ts=8 sw=4 sts=4 et ai: */
